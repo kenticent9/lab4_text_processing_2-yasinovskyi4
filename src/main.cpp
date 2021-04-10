@@ -9,11 +9,13 @@
 #include <thread>
 #include <boost/filesystem.hpp>
 #include <boost/locale.hpp>
+#include <condition_variable>
 
 namespace fs = boost::filesystem;
 namespace ba = boost::locale::boundary;
 
 typedef std::map<std::string, unsigned> counter_t;
+typedef std::pair<std::string, bool> task;
 
 std::queue<std::string> get_buffers(const std::string &indir);
 void generate_locale();
@@ -33,56 +35,102 @@ int main(int argc, char *argv[])
 
     generate_locale();
 
-    auto stage1_start_time = get_current_time_fenced();
-
     std::queue<std::string> files = get_buffers(conf.indir);
 
-    auto stage2_start_time = get_current_time_fenced();
-
-    std::queue<counter_t> counters = get_counters(files, conf);
-
-    counter_t ctr = merge_counters(counters);
-
-    auto finish_time = get_current_time_fenced();
-
-    write_ctr_to_files(ctr, conf);
-
-    auto total_time = finish_time - stage1_start_time;
-    auto stage1_time = stage2_start_time - stage1_start_time;
-    auto stage2_time = finish_time - stage2_start_time;
-
-    std::cout << "Total:    " << to_us(total_time) << " microsec\nReading:  "
-        << to_us(stage1_time) << " microsec\nIndexing: " << to_us(stage2_time)
-        << " microsec" << std::endl;
+//    auto stage1_start_time = get_current_time_fenced();
+//
+//    std::queue<std::string> files = get_buffers(conf.indir);
+//
+//    auto stage2_start_time = get_current_time_fenced();
+//
+//    std::queue<counter_t> counters = get_counters(files, conf);
+//
+//    counter_t ctr = merge_counters(counters);
+//
+//    auto finish_time = get_current_time_fenced();
+//
+//    write_ctr_to_files(ctr, conf);
+//
+//    auto total_time = finish_time - stage1_start_time;
+//    auto stage1_time = stage2_start_time - stage1_start_time;
+//    auto stage2_time = finish_time - stage2_start_time;
+//
+//    std::cout << "Total:    " << to_us(total_time) << " microsec\nReading:  "
+//        << to_us(stage1_time) << " microsec\nIndexing: " << to_us(stage2_time)
+//        << " microsec" << std::endl;
 
     return 0;
+}
+
+std::condition_variable mcond;
+std::mutex mmutex;
+
+// Tasks are pairs of file names and is_finished flags, which realize
+// poison pill
+void f(std::queue<task> &tasks, std::queue<std::string> &buffers)
+{
+    task t;
+
+    for (;;) {
+        {
+        std::unique_lock<std::mutex> lck{mmutex};
+        while (tasks.empty())
+            mcond.wait(lck);
+        t = tasks.front();
+        // If is_finished
+        if (t.second)
+            break;
+        tasks.pop();
+        }
+
+        std::ifstream raw_file(t.first, std::ios::binary);
+        if (!raw_file)
+            throw std::runtime_error("Couldn't open raw_file for reading");
+
+        auto buffer = [&raw_file] {
+            std::ostringstream ss{};
+            ss << raw_file.rdbuf();
+            return ss.str();
+        }();
+
+        {
+        std::lock_guard<std::mutex> lck{mmutex};
+        buffers.push(std::move(buffer));
+        }
+    }
 }
 
 std::queue<std::string> get_buffers(const std::string &indir)
 {
     std::queue<std::string> buffers;
 
+    std::queue<task> tasks;
+
+    std::thread thread{f, ref(tasks), ref(buffers)};
+
     fs::recursive_directory_iterator end;
     for (fs::recursive_directory_iterator it(indir); it != end; it++) {
         if (fs::is_regular_file(it->path())) {
             const std::string &extn = boost::locale::to_lower(it->path().extension().string());
-            if (extn == ".zip") {
-                const std::string &file_name = it->path().string();
+            if (extn == ".txt") {
+                std::string &&file_name = it->path().string();
+                task t{file_name, false};
 
-                std::ifstream raw_file(file_name, std::ios::binary);
-                if (!raw_file)
-                    throw std::runtime_error("Couldn't open raw_file for reading");
-
-                auto buffer = [&raw_file] {
-                    std::ostringstream ss{};
-                    ss << raw_file.rdbuf();
-                    return ss.str();
-                }();
-
-                buffers.push(std::move(buffer));
+                {
+                std::lock_guard<std::mutex> lck{mmutex};
+                tasks.push(std::move(t));
+                }
+                mcond.notify_one();
             }
         }
     }
+    {
+    std::lock_guard<std::mutex> lck{mmutex};
+    tasks.push(task {"", true});
+    }
+    mcond.notify_one();
+
+    thread.join();
 
     return buffers;
 }
